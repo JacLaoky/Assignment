@@ -1,0 +1,131 @@
+\documentclass[10pt,a4paper]{article}
+
+% Fonts and Encoding
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+
+% Packages
+\usepackage{geometry}
+\geometry{a4paper, margin=0.8in}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{subcaption} % 新增：用來排版並排的子圖表
+
+% Title Formatting
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+% Title Information
+\title{\textbf{AI6126 Project 1: CelebAMask Face Parsing}}
+\author{
+    Name: Wu Zihan \\
+    Matriculation Number: G2503317H
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This report details the methodology and implementation of a highly optimized face parsing network designed for the CelebAMask-HQ mini-challenge. Given the strict constraint on trainable parameters ($< 1,821,085$) and the limitation of using only 1,000 training pairs from scratch, the proposed solution focuses on a lightweight yet representationally powerful architecture. The model achieves an impressive F-measure of \textbf{0.8677} on the unseen CodaBench test set.
+
+\section{Model Architecture}
+The core architecture, named \textbf{WiderUNet}, is a custom U-Net variant tailored for parameter efficiency and robust feature extraction. The total number of trainable parameters is \textbf{1,815,097}, which strictly adheres to the 120\% SRResNet baseline constraint.
+
+% --- 這裡可以放入你的網路架構圖 ---
+ \begin{figure}[htbp]
+     \centering
+     \includegraphics[width=0.7\textwidth]{architecture.png}
+     \caption{Overview of the WiderUNet architecture, featuring Dilated Bottlenecks, SE Blocks, and Deep Supervision auxiliary heads.}
+     \label{fig:architecture}
+     \vspace{-0.5cm}
+ \end{figure}
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Encoder-Decoder with Double Convolutions:} The network utilizes Double Convolution blocks (Conv-BN-ReLU-Dropout-Conv-BN-ReLU). The channel progression is 32 $\rightarrow$ 64 $\rightarrow$ 128 $\rightarrow$ 144 to maximize width while maintaining a low parameter count.
+    \item \textbf{Dilated Bottleneck:} The lowest resolution feature map passes through a \textit{Dilated Bottleneck} with dilation rates of 1 and 2, expanding the receptive field to capture global contextual information (e.g., hair and clothing) without adding extra parameters.
+    \item \textbf{Squeeze-and-Excitation (SE) Blocks:} SE blocks (reduction ratio = 16) are integrated after the bottleneck and at every upsampling stage to enhance channel-wise feature responses.
+    \item \textbf{Deep Supervision (Auxiliary Heads):} Two auxiliary classification heads are attached to intermediate decoder stages to facilitate better gradient flow and prevent vanishing gradients.
+\end{itemize}
+
+\section{Loss Functions}
+A hybrid loss function is utilized to handle class imbalance and pixel-wise accuracy simultaneously. 
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Cross-Entropy with Label Smoothing:} Applied with a smoothing factor of 0.05 to prevent overconfidence.
+    \item \textbf{Weighted Dice Loss:} To address severe class imbalance, high weights are assigned to small/challenging components: \textit{left/right ear} (3.0), \textit{ear\_r} (4.0), and \textit{hat} (2.0), while \textit{hair} is down-weighted (0.5).
+    \item \textbf{Auxiliary Loss:} The main loss is supplemented by the CE loss from the two auxiliary heads (scaled by 0.4).
+\end{enumerate}
+
+\section{Training Strategy and Data Augmentation}
+Due to the limited dataset size of 1,000 images, aggressive data augmentation and a two-phase training strategy were employed.
+
+\subsection{Data Augmentation and Occlusion Robustness}
+To combat overfitting on the extremely limited dataset of 1,000 images, an aggressive data augmentation pipeline was designed:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Appearance \& Spatial Transformations:} Random Affine scaling and translation, combined with Color Jittering, are applied to simulate variations in camera poses and lighting.
+    \item \textbf{Shadow and Occlusion Simulation:} Albumentations' \texttt{RandomShadow} is heavily utilized to simulate real-world directional lighting variance. Furthermore, nested \texttt{RandomErasing} is applied strictly to the input images while leaving the ground-truth masks intact. This intentional uncoupling acts as a Cutout regularization, forcing the network to leverage spatial context to infer semantics under occlusions rather than merely mapping missing pixels to the background.
+    \item \textbf{CutMix Strategy:} Applied with a 50\% probability ($\alpha=1.0$). By pasting a patch of an image and its corresponding mask onto another training sample, the model significantly improves its ability to localize semantic boundaries and regularizes against over-confident predictions.
+\end{itemize}
+
+% --- 這裡可以放 CutMix 或 Data Augmentation 的展示圖 ---
+ \begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\textwidth]{augmentation_demo_full.png}
+    \caption{Progression of the data augmentation pipeline on the training set. From left to right: (1) The original image and ground truth mask. (2) Base augmentations including Albumentations RandomShadow, ColorJitter, and RandomErasing. (3) The CutMix strategy blending patches from two different augmented images to force the network to learn robust semantic localization.}
+    \label{fig:augmentation}
+    \vspace{-0.5cm}
+\end{figure}
+
+\subsection{Two-Phase Training and Optimization}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Phase 1 (Validation-driven):} Data is split into 900 train and 100 validation pairs. The model is trained using AdamW and a \textit{CosineAnnealingWarmRestarts} scheduler. The training loss at the best validation F-score is recorded as a target metric.
+    \item \textbf{Phase 2 (Blind Training):} The model is trained from scratch using all 1,000 images until the training loss converges to the target loss found in Phase 1, preventing overfitting.
+    \item \textbf{Exponential Moving Average (EMA):} An EMA shadow model (decay = 0.999) is maintained. Automatic Mixed Precision (AMP) accelerates training.
+\end{itemize}
+
+\section{Inference and Post-Processing}
+\subsection{Test-Time Augmentation (TTA) and Optuna Optimization}
+Predictions are averaged across 5 spatial scales ($0.75, 0.875, 1.0, 1.125, 1.25$) and horizontal flipping (swapping symmetric classes like left/right eye). Furthermore, an \textbf{Optuna study} was conducted on the Phase 1 validation split to find optimal class-specific probability multipliers (e.g., boosting \textit{eye\_g} by $\sim$2.8x) before the \texttt{argmax} operation. 
+
+\subsection{Morphological Cleanup}
+To remove isolated false-positive pixels, a dynamic small-blob removal algorithm using Connected Components is applied. The minimum acceptable pixel area for each class (e.g., 400 pixels for hats, 40 for eyes) was jointly optimized using Optuna.
+
+\section{Qualitative Results}
+Figure \ref{fig:qualitative} visualizes the performance of the model on the Phase 1 validation split. The predicted masks demonstrate sharp semantic boundaries and successful handling of challenging components such as eyeglasses and hair, validating the effectiveness of the proposed architecture and augmentations.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\textwidth]{qualitative_results.png}
+    \caption{Qualitative results evaluated on the validation split. The model correctly parses fine details and adheres closely to the ground truth mask.}
+    \label{fig:qualitative}
+    \vspace{-0.5cm}
+\end{figure}
+
+\subsection{Ablation Study on Inference Strategies}
+To demonstrate the absolute necessity and effectiveness of the proposed inference pipeline, Figure \ref{fig:tta_ablation} visualizes an ablation study comparing the raw baseline prediction against the fully optimized pipeline (Multi-scale TTA + Optuna Probability Shifts + Morphological Cleanup) on three highly challenging validation samples.
+
+Relying solely on a single forward pass (\textit{Baseline}) leaves the model highly vulnerable to complex visual artifacts. As observed in the \textbf{first row}, extreme lighting conditions and facial graphics completely shatter the baseline's prediction, resulting in severely fragmented semantic regions and a complete failure to localize the nose and eyes. By incorporating \textbf{Multi-scale TTA}, the network robustly fuses features across different resolutions, successfully recovering the continuous facial structure and accurately localizing the facial components despite the severe photometric interference.
+
+Furthermore, the baseline struggles with complex backgrounds and blur. In the \textbf{second row}, background line drawings trick the baseline into hallucinating scattered hair and skin pixels. In the \textbf{third row}, a blurry foreground occlusion causes jagged and noisy boundaries along the hair and neck. The integration of \textbf{Optuna-optimized probability shifts} and \textbf{morphological cleanup} (blob removal) aggressively filters out these isolated false-positive artifacts, yielding remarkably smooth and clean semantic boundaries that closely mirror the Ground Truth. This highlights how the combined post-processing pipeline acts as a powerful regularizer for noisy predictions.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]{tta_optuna_ablation.png} % 記得把檔名改成你的 .jpg 檔
+    \caption{Ablation study highlighting the most significant improvements from the optimized inference pipeline. Left to right: (1) Input image; (2) Baseline prediction; (3) Final optimized prediction (TTA + Optuna + Blob Removal); (4) Ground Truth. The fully optimized pipeline successfully rescues severe fragmentation (Row 1), eliminates background hallucinations (Row 2), and smooths boundaries under occlusions (Row 3).}
+    \label{fig:tta_ablation}
+    \vspace{-0.5cm}
+\end{figure}
+
+\section{Conclusion}
+The proposed WiderUNet demonstrates that highly competitive face parsing performance can be achieved without relying on massive models or external data. By effectively utilizing CutMix, EMA, Optuna-optimized inference, and multi-scale TTA, the model successfully generalizes to unseen test data, scoring \textbf{0.8677} F-measure within the $<1.82M$ parameter constraint.
+
+\end{document}
